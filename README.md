@@ -12,7 +12,7 @@ The script patches a **copy of a dump of your own monitor's firmware**. No firmw
 
 | Monitor | Scaler | Result |
 |---|---|---|
-| HP EliteDisplay E190i | Realtek | Patched. VGA: an Amiga 600 (15.6 kHz, 50 Hz PAL) shows a clean picture with no warning box, all menus work, and auto adjust works like with a PC. DisplayPort: 15.7 kHz / 59 Hz 240p from a RetroScaler2x with its line doubling off, through an HDMI-DisplayPort adapter (before the patch it needed the scaler's 2x mode). DVI: HDMI sources through a passive HDMI-DVI adapter (Ultimate64 in HDMI mode, RetroScaler2x) now work; unpatched they gave "No Input Signal". `--wide400` and `--smooth400` confirmed working: 320x200 DOS games look clean, text mode crisp or smoothed. `--aspect43` confirmed working. `--manual-auto` confirmed: no automatic auto adjust on new modes. |
+| HP EliteDisplay E190i | Realtek | Patched. VGA: an Amiga 600 (15.6 kHz, 50 Hz PAL) shows a clean picture with no warning box, also in PAL and NTSC interlace, all menus work, and auto adjust works like with a PC. DisplayPort: 15.7 kHz / 59 Hz 240p from a RetroScaler2x with its line doubling off, through an HDMI-DisplayPort adapter (before the patch it needed the scaler's 2x mode). DVI: HDMI sources through a passive HDMI-DVI adapter (Ultimate64 in HDMI mode, RetroScaler2x) now work; unpatched they gave "No Input Signal". `--wide400` and `--smooth400` confirmed working: 320x200 DOS games look clean, text mode crisp or smoothed. `--aspect43` confirmed working. `--manual-auto` confirmed: no automatic auto adjust on new modes. |
 | Lenovo ThinkVision LT1913p | Realtek | Accepts 15 kHz out of the box, nothing to patch. Amiga 600 on VGA works without any warning box. The script can also apply `--wide400` and `--aspect43` to its firmware, but the patched image could not be flashed: the flash chip is write protected (see Flash chip notes). |
 
 Other monitors may or may not have the same code. The script only changes a firmware when it finds the exact patterns it expects, and stops otherwise.
@@ -144,7 +144,7 @@ If the monitor seems dead or stuck after flashing, first do the full power-off f
 
 - Lowering the firmware limit does not guarantee that a monitor's hardware can lock onto 15 kHz.
 - Picture position may need adjusting in the monitor menu.
-- Interlaced 480i / 576i was not tested.
+- Interlaced 15 kHz video works on the HP's VGA input (Amiga Deluxe Paint IV in PAL and NTSC interlace). It flickers like it would on a CRT.
 - HP E190i DVI input with HDMI sources: works after patching (video only). Before the patch, workarounds were setting the Ultimate64's video output to DVI, or an active HDMI-DisplayPort adapter.
 - HP E190i DisplayPort with the RetroScaler2x at 15 kHz: sometimes not detected at first. Switching the RetroScaler to 2x and back makes it appear.
 
