@@ -1,0 +1,256 @@
+Changes to rtd266x_programmer (https://github.com/bleughb/rtd266x_programmer, commit e83f32e)
+SPDX-License-Identifier: CC0-1.0 (these changes only; the tool itself is not part of this repository)
+
+Apply in a clone of the tool:   patch -p1 < rtd266x_programmer.patch   then   make
+
+- Chip entries: MX25L4005 (512 KB, the size was wrong in some copies), MX25L2005 (256 KB),
+  Puya P25Q40H; Macronix and Puya use the same command codes as Winbond.
+- i2clinux.cpp: include <linux/i2c-dev.h> directly (builds on current Linux).
+- Status register writes wait for the chip to finish and are retried.
+- Refuses to erase while the flash is still write protected, and says why.
+- Waits for the chip erase to finish before writing.
+- Prints "Flash OK" / "FLASH FAILED" from the CRC check (it was printed but not judged).
+- -w <reg> (experimental): drive the flash WP# pin through an MCU register
+  (ThinkVision LT1913p: 0xd7). Unlocks the status register there, but writing still fails.
+- -t <addr>: safe write test in an empty, unused 4 KB sector.
+
+--- a/main.cpp
++++ b/main.cpp
+@@ -4,6 +4,7 @@
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <memory.h>
++#include <unistd.h>
+ #include "crc.h"
+ #include "i2c.h"
+ #include "gff.h"
+@@ -50,6 +51,10 @@
+     // Microchip
+     {"SST25VF512" , 0xBF4800,       64,       256, 32},
+     {"SST25VF032" , 0xBF4A00, 4 * 1024,       256, 32},
++    {"MX25L4005"  , 0xC22013,      512,       256, 64},
++        // Manufacturer: Puya
++    {"P25Q40H"    , 0x856013,      512,       256, 64},
++    {"MX25L2005"  , 0xC22012,      256,       256, 64},
+     {NULL , 0, 0, 0, 0}
+ };
+ 
+@@ -172,6 +177,8 @@
+   uint8_t manufacturer_id = GetManufacturerId(jedec_id);
+   switch (manufacturer_id) {
+   case 0xEF:
++  case 0xC2:
++  case 0x85:
+     // These are the codes for Winbond
+     WriteReg(0x62, 0x6);  // Flash Write enable op code
+     WriteReg(0x63, 0x50); // Flash Write register op code
+@@ -280,6 +287,75 @@
+   return false;
+ }
+ 
++// Write the flash status register and wait until the chip has finished (WIP bit clear).
++// Tries the WREN + WRSR sequence first, then EWSR + WRSR, up to 4 times. Returns the final status.
++uint8_t WriteStatus(uint8_t value, bool verbose) {
++  uint8_t st = 0;
++  for (int i = 0; i < 4; i++) {
++    ECommondCommandType t = (i & 1) ? E_CC_WRITE_AFTER_EWSR : E_CC_WRITE_AFTER_WREN;
++    SPICommonCommand(t, 1, 0, 1, value);
++    int n = 0;
++    do {
++      usleep(10000);
++      st = SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0);
++    } while ((st & 1) && ++n < 100);
++    if (verbose)
++      printf("  write status 0x%02x (%s): status now 0x%02x\n", value, (i & 1) ? "EWSR" : "WREN", st);
++    if ((st & 0x9c) == (value & 0x9c)) break;
++  }
++  return st;
++}
++
++// Clear the block protect bits (and SRWD) before erasing / programming.
++uint8_t Unprotect() {
++  return WriteStatus(0, true);
++}
++
++// Protect the blocks again; the status register itself stays unlocked (SRWD clear).
++void Reprotect() {
++  WriteStatus(0x1c, true);
++}
++
++// Safe write test in an unused sector: program one page, read back, erase the sector, read back.
++void WriteTest(uint32_t addr) {
++  uint8_t buf[256], rd[256];
++  SPIRead(addr, rd, 256);
++  for (int i = 0; i < 256; i++) {
++    if (rd[i] != 0xff) {
++      printf("Test page 0x%05x is not empty, test skipped.\n", addr);
++      return;
++    }
++  }
++  printf("Write test at 0x%05x:\n", addr);
++  uint8_t st = Unprotect();
++  printf("  status before test: 0x%02x\n", st);
++  for (int i = 0; i < 256; i++) buf[i] = i;
++  WriteReg(0x71, 255);
++  WriteReg(0x64, addr >> 16);
++  WriteReg(0x65, addr >> 8);
++  WriteReg(0x66, addr);
++  for (int i = 0; i < 256; i += 32) WriteBytesToAddr(0x70, buf + i, 32);
++  WriteReg(0x6f, 0xa0);
++  while (ReadReg(0x6f) & 0x40) {}
++  usleep(10000);
++  SPIRead(addr, rd, 256);
++  int ok = 0;
++  for (int i = 0; i < 256; i++) ok += rd[i] == buf[i];
++  printf("  page program: %d of 256 bytes written (first bytes %02x %02x %02x %02x)\n", ok, rd[0], rd[1], rd[2], rd[3]);
++  printf("  status after program: 0x%02x\n", SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0));
++  SPICommonCommand(E_CC_ERASE, 0x20, 0, 3, addr);   // 4 KB sector erase
++  for (int n = 0; n < 100 && (SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0) & 1); n++) usleep(10000);
++  SPIRead(addr, rd, 256);
++  int ff = 0;
++  for (int i = 0; i < 256; i++) ff += rd[i] == 0xff;
++  printf("  sector erase: %d of 256 bytes erased\n", ff);
++  if (ff != 256)
++    printf("  WARNING: the test pattern is still in flash at 0x%05x (harmless, the area is unused)\n", addr);
++  printf("  status after test: 0x%02x\n", SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0));
++  Reprotect();
++  printf("  status after reprotect: 0x%02x\n", SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0));
++}
++
+ bool ProgramFlash(const char *input_file_name, uint32_t chip_size) {
+   uint32_t prog_size;
+   uint8_t* prog = ReadFile(input_file_name, &prog_size);
+@@ -287,9 +363,22 @@
+     return false;
+   }
+   printf("Erasing...");fflush(stdout);
+-  SPICommonCommand(E_CC_WRITE_AFTER_EWSR, 1, 0, 1, 0); // Unprotect the Status Register
+-  SPICommonCommand(E_CC_WRITE_AFTER_WREN, 1, 0, 1, 0); // Unprotect the flash
++  printf("\n");
++  {
++    uint8_t st = Unprotect();
++    printf("Status register after unprotect: 0x%02x\n", st);
++    if (st & 0x9c) {
++      printf("The flash is still write protected (block protect bits 0x%02x).\n", st & 0x1c);
++      if (st & 0x80)
++        printf("Bit 7 (SRWD) is set: the status register is locked while the chip's WP# pin is low.\n");
++      printf("Nothing was erased or written.\n");
++      delete [] prog;
++      return false;
++    }
++  }
+   SPICommonCommand(E_CC_ERASE, 0xc7, 0, 0, 0);         // Chip Erase
++  for (int n = 0; n < 1000 && (SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0) & 1); n++)
++    usleep(10000);                                     // wait for the erase to finish (WIP)
+   printf("done\n");
+ 
+   //RTD266x can program only 256 bytes at a time.
+@@ -349,8 +438,7 @@
+     b = ReadReg(0x6f);
+   } while (b & 0x40);
+ 
+-  SPICommonCommand(E_CC_WRITE_AFTER_EWSR, 1, 0, 1, 0x1c); // Unprotect the Status Register
+-  SPICommonCommand(E_CC_WRITE_AFTER_WREN, 1, 0, 1, 0x1c); // Protect the flash
++  Reprotect();
+ 
+   uint8_t data_crc = GetCRC();
+   uint8_t chip_crc = SPIComputeCRC(0, addr - 1);
+@@ -376,6 +464,11 @@
+   "                  the board (if it finds one)\n"
+   "  -b <file>     : Backup the current firmware on the RTD266X to a file\n"
+   "  -f <file>     : Flash a file to the RTD266X\n"
++  "  -w <reg>      : Experimental: drive the flash WP# pin high through this MCU\n"
++  "                  register while working (ThinkVision LT1913p: -w 0xd7).\n"
++  "                  Without -f / -t: only tests whether the protection can be cleared.\n"
++  "  -t <addr>     : Write test: program, read back and erase one page at <addr>\n"
++  "                  (must be an empty, unused 4 KB sector, e.g. 0xf000; use with -w)\n"
+ };
+ 
+ int main(int argc, char** argv)
+@@ -383,6 +476,8 @@
+   int deviceno = -1;
+   char *filename = NULL;
+   int action = -1;
++  int wp_reg = -1;
++  long test_addr = -1;
+   argv++;
+ 
+   if (argc == 1) {
+@@ -424,6 +519,24 @@
+         exit(EXIT_FAILURE);
+       }
+     }
++    else if (strcmp(*argv, "-w") == 0) {
++      if (--argc) {
++        wp_reg = strtol(*(++argv), NULL, 0);
++      }
++      if (wp_reg < 0 || wp_reg > 0xff) {
++        fprintf(stderr, "Error: -w needs a register number such as 0xd7\n");
++        exit(EXIT_FAILURE);
++      }
++    }
++    else if (strcmp(*argv, "-t") == 0) {
++      if (--argc) {
++        test_addr = strtol(*(++argv), NULL, 0);
++      }
++      if (test_addr < 0 || (test_addr & 0xfff)) {
++        fprintf(stderr, "Error: -t needs a 4 KB aligned address of an empty sector, e.g. 0xf000\n");
++        exit(EXIT_FAILURE);
++      }
++    }
+     else if (strcmp(*argv, "-h") == 0) {
+       printf("%s", help);
+       exit(EXIT_SUCCESS);
+@@ -504,11 +617,32 @@
+   b = SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0);
+   printf("Flash status register: 0x%02x\n", b);
+ 
++  if (wp_reg >= 0) {
++    uint8_t before = ReadReg(wp_reg);
++    WriteReg(wp_reg, 1);
++    uint8_t after = ReadReg(wp_reg);
++    printf("WP# control register 0x%02x: 0x%02x, set to 1, reads back 0x%02x\n", wp_reg, before, after);
++    if (action == -1 && test_addr < 0) {
++      // test only: try to unlock, report, leave the chip protected but not locked (as after a flash)
++      b = Unprotect();
++      printf("Status register after unprotect: 0x%02x -> %s\n", b,
++             (b & 0x9c) ? "still protected" : "unlocked");
++      Reprotect();
++      printf("Status register now: 0x%02x\n", SPICommonCommand(E_CC_READ, 0x5, 1, 0, 0));
++    }
++  }
++  if (test_addr >= 0)
++    WriteTest(test_addr);
++
+ //#if 1
+   if (action == BACKUP)
+     SaveFlash(filename, chip->size_kb * 1024);
+   else if (action == FLASH)
+-    ProgramFlash(filename, chip->size_kb * 1024);
++    printf(ProgramFlash(filename, chip->size_kb * 1024) ? "Flash OK (CRC matches).\n" : "FLASH FAILED: verify does not match.\n");
++  if (wp_reg >= 0) {
++    WriteReg(wp_reg, 0);
++    printf("WP# control register 0x%02x set back to 0\n", wp_reg);
++  }
+ //  SaveFlash("flash-test.bin", chip->size_kb * 1024);
+ //#else
+ //  ProgramFlash("1024x600.bin", chip->size_kb * 1024);
+--- a/i2clinux.cpp
++++ b/i2clinux.cpp
+@@ -3,9 +3,13 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/ioctl.h>
+-extern "C"
+-{
+-  #include <linux/i2c-dev.h>
++//extern "C"
++//{
++//  #include <linux/i2c-dev.h>
++//}
++#include <linux/i2c-dev.h>
++extern "C" {
++    #include <i2c/smbus.h>
+ }
+ 
+ static int file;
