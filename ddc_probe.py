@@ -20,6 +20,17 @@ and registers live while the monitor runs normally:
   python3 ddc_probe.py watch BUS ADDR [ADDR...]  # keep reading, print a line whenever a value changes
   python3 ddc_probe.py dump BUS START END FILE    # save firmware RAM (0xF800-0xFEFF) to a file
   python3 ddc_probe.py diff FILE_A FILE_B        # show which RAM bytes differ between two dumps
+  python3 ddc_probe.py poke BUS ADDR VALUE       # write one byte (needs debug VCP 0xE1: Fujitsu
+                                                 # B19-7 with --ddc-debug; only the frame sync delay registers
+                                                 # 0x40-0x44 are allowed)
+  python3 ddc_probe.py disp BUS                  # read the display timing registers (DH/DV total,
+                                                 # background/active start and end) through the
+                                                 # 0x2A/0x2B port; needs VCP 0xE1 (Fujitsu)
+  python3 ddc_probe.py dispset BUS NAME VALUE    # live test: set 'vact' (V active start, end follows)
+                                                 # or 'vbg' (V background start, end follows);
+                                                 # undone by any mode change
+  python3 ddc_probe.py ports BUS                 # read the display format (0x2A/2B), highlight window
+                                                 # (0x60/61) and scale-up (0x33/34) registers; same build
 Only read addresses you were told to: some scaler registers are data ports where a
 read moves an internal pointer.
 
@@ -30,6 +41,7 @@ flash engine); 0x60 and 0x6F start flash operations / programming mode and are r
 import ctypes
 import fcntl
 import os
+import re
 import sys
 import time
 
@@ -80,10 +92,15 @@ def write_reg(fd, reg, val, addr=RTD):
 
 
 def cmd_list():
-    base = '/sys/class/i2c-adapter'
-    if not os.path.isdir(base):
+    # /sys/class/i2c-adapter is missing on some kernels (e.g. Raspberry Pi OS); /sys/class/i2c-dev
+    # (with i2c-dev loaded) and /sys/bus/i2c/devices list the same buses
+    for base in ('/sys/class/i2c-adapter', '/sys/class/i2c-dev', '/sys/bus/i2c/devices'):
+        names = [n for n in os.listdir(base) if re.fullmatch(r'i2c-\d+', n)] if os.path.isdir(base) else []
+        if names:
+            break
+    else:
         sys.exit('No I2C adapters found. Try: modprobe i2c-dev')
-    for name in sorted(os.listdir(base), key=lambda n: int(n.split('-')[1])):
+    for name in sorted(names, key=lambda n: int(n.split('-')[1])):
         try:
             with open(os.path.join(base, name, 'name')) as f:
                 label = f.read().strip()
@@ -229,6 +246,110 @@ def peek(fd, address, tries=4):
     raise err
 
 
+POKE_OK = (0x0040, 0x0041, 0x0042, 0x0043, 0x0044)   # frame sync delays; 0x44 bit 7 selects what 0x44/0x45 report
+
+
+def cmd_poke(bus, address, value):
+    if address not in POKE_OK or not 0 <= value <= 0xFF:
+        sys.exit('poke is limited to scaler registers %s and values 0-255.' % ', '.join('0x%04X' % a for a in POKE_OK))
+    fd = open_bus(bus)
+    before = peek(fd, address)
+    vcp_set(fd, DBG, address)      # remember the address (VCP E0)
+    time.sleep(0.03)
+    vcp_set(fd, DBG + 1, value)    # write the byte (VCP E1)
+    time.sleep(0.05)
+    after = peek(fd, address)
+    print('0x%04X: 0x%02X -> 0x%02X (read back 0x%02X)' % (address, before, value, after))
+    os.close(fd)
+
+
+DISP_REGS = [  # (index, name) of the display format registers behind port 0x2A/0x2B, 16 bit pairs
+    (0x00, 'DH total'), (0x02, 'DH sync end'), (0x03, 'DH bkgd start'), (0x05, 'DH active start'),
+    (0x07, 'DH active end'), (0x09, 'DH bkgd end'), (0x0B, 'DV total'), (0x0D, 'DV sync end'),
+    (0x0E, 'DV bkgd start'), (0x10, 'DV active start'), (0x12, 'DV active end'), (0x14, 'DV bkgd end'),
+]
+
+
+def cmd_disp(bus):
+    fd = open_bus(bus)
+
+    def rd(i):
+        vcp_set(fd, DBG, 0x002A)
+        time.sleep(0.03)
+        vcp_set(fd, DBG + 1, i)        # index (VCP E1 writes it to 0x2A)
+        time.sleep(0.03)
+        return peek(fd, 0x002B)
+    for i, name in DISP_REGS:
+        if name.endswith('sync end'):
+            print('%-16s 0x%02X: %d' % (name, i, rd(i)))
+        else:
+            hi, lo = rd(i), rd(i + 1)
+            print('%-16s 0x%02X: %d' % (name, i, (hi & 0x0F) << 8 | lo))
+    os.close(fd)
+
+
+PORT_SETS = [  # (name, index port, data port, indices) - read only, index written before every read
+    ('display', 0x2A, 0x2B, range(0x00, 0x24)),
+    ('highlight window', 0x60, 0x61, range(0x00, 0x0E)),
+    ('scale up', 0x33, 0x34, range(0x00, 0x12)),
+]
+
+
+def cmd_ports(bus):
+    fd = open_bus(bus)
+    for name, ip, dp, idx in PORT_SETS:
+        vals = []
+        for i in idx:
+            try:
+                vcp_set(fd, DBG, ip)
+                time.sleep(0.03)
+                vcp_set(fd, DBG + 1, i)
+                time.sleep(0.03)
+                vals.append('%02X' % peek(fd, dp))
+            except (OSError, ValueError):
+                vals.append('--')
+        print('%s (0x%02X/0x%02X):' % (name, ip, dp))
+        for k in range(0, len(vals), 16):
+            print('  %02X: %s' % (idx[0] + k, ' '.join(vals[k:k + 16])))
+    os.close(fd)
+
+
+def cmd_dispset(bus, name, value):
+    """Move the vertical active window (start and end together, same height) or the background
+    window. Writes only display registers 0x0E-0x15, through the 0x2A/0x2B port."""
+    base = {'vact': 0x10, 'vbg': 0x0E}.get(name)
+    if base is None or not 0 <= value <= 1200:
+        sys.exit("dispset: NAME is 'vact' or 'vbg', VALUE 0-1200.")
+    fd = open_bus(bus)
+
+    def wr(i, v):
+        vcp_set(fd, DBG, 0x002A)
+        time.sleep(0.03)
+        vcp_set(fd, DBG + 1, i)
+        time.sleep(0.03)
+        vcp_set(fd, DBG, 0x002B)
+        time.sleep(0.03)
+        vcp_set(fd, DBG + 1, v)
+        time.sleep(0.03)
+
+    def rd(i):
+        vcp_set(fd, DBG, 0x002A)
+        time.sleep(0.03)
+        vcp_set(fd, DBG + 1, i)
+        time.sleep(0.03)
+        return peek(fd, 0x002B)
+    end_i = base + 2 if name == 'vact' else 0x14
+    raw = {i: rd(i) for i in (base, base + 1, end_i, end_i + 1)}   # read once, then only write
+    start = (raw[base] & 0x0F) << 8 | raw[base + 1]
+    end = (raw[end_i] & 0x0F) << 8 | raw[end_i + 1]
+    new_end = end + value - start
+    for i, v in ((base, value), (end_i, new_end)):
+        wr(i, (raw[i] & 0xF0) | (v >> 8))
+        wr(i + 1, v & 0xFF)
+    print('%s: start %d -> %d, end %d -> %d' % (name, start, value, end, new_end))
+    os.close(fd)
+
+
 def cmd_peek(bus, addrs):
     fd = open_bus(bus)
     for a in addrs:
@@ -335,6 +456,14 @@ def main():
         cmd_vcpset(num(a[1]), num(a[2]), num(a[3]))
     elif c == 'peek' and len(a) >= 3:
         cmd_peek(num(a[1]), [num(x) for x in a[2:]])
+    elif c == 'ports' and len(a) == 2:
+        cmd_ports(num(a[1]))
+    elif c == 'dispset' and len(a) == 4:
+        cmd_dispset(num(a[1]), a[2], num(a[3]))
+    elif c == 'disp' and len(a) == 2:
+        cmd_disp(num(a[1]))
+    elif c == 'poke' and len(a) == 4:
+        cmd_poke(num(a[1]), num(a[2]), num(a[3]))
     elif c == 'watch' and len(a) >= 3:
         cmd_watch(num(a[1]), [num(x) for x in a[2:]])
     elif c == 'dump' and len(a) == 5:
